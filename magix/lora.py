@@ -5,8 +5,6 @@ from typing import Any, Callable, Dict
 import jax
 import jax.numpy as jnp
 import flax
-from flax import core, struct
-import optax
 
 
 def adapt_params(params, lora_states, alpha=32):

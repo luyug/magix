@@ -1,8 +1,8 @@
-
 import orbax.checkpoint
 import numpy as np
 import jax
 import logging
+from typing import Any, Iterable
 from functools import partial
 from jax.sharding import Mesh
 
@@ -59,6 +59,24 @@ def load_model_hub(
     return model, sharded_params
 
 
+def load_by_sharding(
+    checkpoint_manager: orbax.checkpoint.CheckpointManager,
+    items: Iterable[str],
+    dummies: Iterable[Any],
+    shardings: Iterable[Any],
+):
+    restore_kwargs = {
+        item: {'restore_args': array_restore_args_from_sharding_pytree(s)}
+        for item, s in zip(items, shardings)
+    }
+    restored = checkpoint_manager.restore(
+        checkpoint_manager.latest_step(),
+        items={item: dummy for item, dummy in zip(items, dummies)},
+        restore_kwargs=restore_kwargs
+    )
+    return restored
+
+
 def load_model_and_optimizer_local(
     model_cls,
     optimizer,
@@ -95,17 +113,11 @@ def load_model_and_optimizer_local(
     
     # Restore model and optimizer from local storage
     step = checkpoint_manager.latest_step() if step is None else step
-    restore_kwargs = {
-        'model': {'restore_args': array_restore_args_from_sharding_pytree(model_sharding)},
-        'optimizer': {'restore_args': array_restore_args_from_sharding_pytree(opt_sharding)}
-    }
-    restored = checkpoint_manager.restore(
-        checkpoint_manager.latest_step(),
-        items={
-            'model': model_no_init._params_shape_tree,
-            'optimizer': opt_shapes
-        }, 
-        restore_kwargs=restore_kwargs
+    restored = load_by_sharding(
+        checkpoint_manager,
+        items=['model', 'optimizer'],
+        dummies=[model_no_init._params_shape_tree, opt_shapes],
+        shardings=[model_sharding, opt_sharding]
     )
     params, opt_state = restored['model'], restored['optimizer']
     logger.info(
@@ -150,7 +162,7 @@ def load_model_local(
     
     return model_no_init, params
 
-
+    
 def save_model_local(
     params,
     path,

@@ -2,6 +2,7 @@ from .checkpoint_utils import (
     load_model_and_optimizer_local,
     load_model_local,
     load_model_hub,
+    save_model_local,
     get_chckpoint_manager
 )
 from .spmd_utils import (

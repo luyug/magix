@@ -1,6 +1,4 @@
 import os
-# set environment variables
-os.environ['HF_HOME'] = 'hf_home'
 import logging
 
 from dataclasses import dataclass, field
@@ -31,9 +29,9 @@ class GenerateArgs:
     seed: int = 42
     max_length: int = 512
     model_type: str = 'llama'
-    model_name_or_path: str = 'NousResearch/Llama-2-7b-hf'
+    model_name_or_path: str = None
     model_config_name: Optional[str] = None
-    tokenizer_name_or_path: str = 'NousResearch/Llama-2-7b-hf'
+    tokenizer_name_or_path: str = None
     mesh_shape: List[int] = list_field(1, -1)
     hf_format: bool = False
 
@@ -41,7 +39,6 @@ def main():
     parser = ArgumentParser()
     parser.add_arguments(GenerateArgs, dest="generate_args")
     args = parser.parse_args().generate_args
-    
     
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer_name_or_path,

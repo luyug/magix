@@ -1,6 +1,4 @@
 import os
-# set environment variables
-os.environ['HF_HOME'] = 'hf_home'
 import logging
 
 from dataclasses import dataclass, field
@@ -30,14 +28,6 @@ from magix import (
     load_model_and_optimizer_local,
     initialize_opt_state
 )
-
-# logger with date and time
-logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-    datefmt='%m/%d/%Y %H:%M:%S',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
 
 
 class TrainDataset:
@@ -118,7 +108,7 @@ class TrainArgs:
 @dataclass
 class ModelArgs:
     model_type: str = 'llama'
-    model_name: str = 'NousResearch/Llama-2-7b-hf'
+    model_name: str = None
     model_cache_dir: str = None
     mesh_shape: List[int] = list_field(-1, 1)
 
@@ -130,6 +120,14 @@ def main():
     train_args: TrainArgs = args.train_args
     model_args: ModelArgs = args.model_args
     
+    # logger with date and time
+    logging.basicConfig(
+        format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+        datefmt='%m/%d/%Y %H:%M:%S',
+        level=logging.INFO
+    )
+    logger = logging.getLogger(__name__)
+    
     # dataset setup
     if train_args.train_file.endswith('.jsonl'):
         train_data = datasets.load_dataset('json', data_files=train_args.train_file)['train']
@@ -138,7 +136,7 @@ def main():
             train_args.train_file,
             train_args.train_data_config
         )['train']
-    tokenizer = tokenizer = AutoTokenizer.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name,
         add_eos_token=True, use_fast=True, padding_side='left', legacy=False)
     tokenizer.pad_token = tokenizer.eos_token
@@ -175,7 +173,7 @@ def main():
     
     if is_new_train:
         logger.info("Loading model from hub")
-        model, params = load_model_hub(_model_cls, model_args.model_name, sharding_config, mesh, half=False)
+        model, params = load_model_hub(_model_cls, model_args.model_name, sharding_config, mesh, half=True)
         opt_state = initialize_opt_state(optimizer, params, sharding_config, mesh)
     else:
         logger.info("Loading model from checkpoint")

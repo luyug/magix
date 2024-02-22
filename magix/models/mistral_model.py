@@ -1,3 +1,4 @@
+import math
 from typing import Optional, Tuple
 from functools import partial
 
@@ -7,8 +8,9 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 from jax.sharding import PartitionSpec as PS
-from jax.experimental.pallas.ops.tpu import flash_attention
-
+from jax._src import mesh as mesh_lib
+from jax.experimental.pallas.ops import attention as attn_ops
+from jax.experimental.shard_map import shard_map
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
@@ -16,13 +18,16 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 
 from transformers.modeling_flax_outputs import (
     FlaxBaseModelOutput,
-    FlaxBaseModelOutputWithPast,
     FlaxCausalLMOutput,
-    FlaxCausalLMOutputWithCrossAttentions,
 )
 from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append_call_sample_docstring, logging
 from transformers import MistralConfig
 
+try:
+    from transformer_engine.jax import fused_attn as te_attn
+    _te_available = True
+except ImportError:
+    _te_available = False
 
 logger = logging.get_logger(__name__)
 
@@ -44,7 +49,6 @@ class FlaxMistralRMSNorm(nn.Module):
         return self.weight * jnp.asarray(hidden_states, dtype=self.dtype)
 
 
-# Copied from transformers.models.llama.modeling_flax_llama.FlaxLlamaRotaryEmbedding with Llama->Mistral
 class FlaxMistralRotaryEmbedding(nn.Module):
     config: MistralConfig
     dtype: jnp.dtype = jnp.float32
@@ -66,7 +70,6 @@ class FlaxMistralRotaryEmbedding(nn.Module):
         return key, query
 
 
-# Copied from transformers.models.llama.modeling_flax_llama.FlaxLlamaMLP with Llama->Mistral
 class FlaxMistralMLP(nn.Module):
     config: MistralConfig
     dtype: jnp.dtype = jnp.float32
@@ -93,12 +96,10 @@ class FlaxMistralMLP(nn.Module):
         return hidden_states
 
 
-# Copied from transformers.models.llama.modeling_flax_llama.apply_rotary_pos_emb
 def apply_rotary_pos_emb(tensor, sin_pos, cos_pos):
     return (tensor * cos_pos) + (rotate_half(tensor) * sin_pos)
 
 
-# Copied from transformers.models.llama.modeling_flax_llama.create_sinusoidal_positions
 def create_sinusoidal_positions(num_pos, dim):
     inv_freq = 1.0 / (10000 ** (np.arange(0, dim, 2) / dim))
     freqs = np.einsum("i , j -> i j", np.arange(num_pos), inv_freq).astype("float32")
@@ -108,7 +109,6 @@ def create_sinusoidal_positions(num_pos, dim):
     return jnp.array(out[:, :, :num_pos])
 
 
-# Copied from transformers.models.llama.modeling_flax_llama.rotate_half
 def rotate_half(tensor):
     """Rotates half the hidden dims of the input."""
     rotate_half_tensor = jnp.concatenate(
@@ -167,7 +167,6 @@ class FlaxMistralAttention(nn.Module):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     @nn.compact
-    # Copied from transformers.models.gpt_neo.modeling_flax_gpt_neo.FlaxGPTNeoSelfAttention._concatenate_to_cache
     def _concatenate_to_cache(self, key, value, query, attention_mask):
         """
         This function takes projected key, value states from a single input token and concatenates the states to cached
@@ -238,21 +237,18 @@ class FlaxMistralAttention(nn.Module):
                 key_states, value_states, query_states, attention_mask
             )
 
-        attention_bias = lax.select(
-            attention_mask > 0,
-            jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-            jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-        )
+        if not self.fused_attention or query_length < 65 or not _te_available:
+            attention_bias = lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+            )
 
-        # usual dot product attention
-        attention_dtype = jnp.float32 if self.attention_softmax_in_fp32 else self.dtype
-        
-        
-        key_states = flax_repeat_kv(key_states, self.num_key_value_groups)
-        value_states = flax_repeat_kv(value_states, self.num_key_value_groups)
+            # usual dot product attention
+            attention_dtype = jnp.float32 if self.attention_softmax_in_fp32 else self.dtype
             
-
-        if not self.fused_attention or query_length < 65 or jax.default_backend() == "cpu":
+            key_states = flax_repeat_kv(key_states, self.num_key_value_groups)
+            value_states = flax_repeat_kv(value_states, self.num_key_value_groups)
             attn_weights = dot_product_attention_weights(
                 query_states,
                 key_states,
@@ -266,42 +262,27 @@ class FlaxMistralAttention(nn.Module):
             query_states = lax.with_sharding_constraint(query_states, PS('data', None, 'model', None))
             key_states = lax.with_sharding_constraint(key_states, PS('data', None, 'model', None))
             value_states = lax.with_sharding_constraint(value_states, PS('data', None, 'model', None))
-        
-        elif jax.default_backend() == "tpu":
-            import math
-            from jax.experimental import shard_map
-            from jax._src import mesh as mesh_lib
-            mesh = mesh_lib.thread_resources.env.physical_mesh
+            if self.attention_softmax_in_fp32:
+                attn_weights = attn_weights.astype(self.dtype)
+            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_states)
             
-            query, key, value = map(lambda x: x.astype(jnp.bfloat16), (query_states, key_states, value_states))
-            query = query.swapaxes(1,2)
-            key = key.swapaxes(1,2)
-            value = value.swapaxes(1,2)
-            shmap_dec = partial(
-                shard_map.shard_map,
-                mesh=mesh,
-                in_specs=(PS('data', 'model', None, None), PS('data', 'model', None, None), PS('data', 'model', None, None)),
-                out_specs=PS('data', 'model', None, None),
-                check_rep=False,
-            )
-            @shmap_dec
-            def attn_map(q, k, v):
-                return flash_attention.flash_attention(
-                    q, k, v, ab=attention_bias, 
-                    causal=True,
-                    sm_scale=math.sqrt(query.shape[-1]),
-                )
-            attn_output = attn_map(query, key, value)
-            attn_output = attn_output.swapaxes(1,2)
-            attn_output = lax.with_sharding_constraint(attn_output, PS('data', None, 'model', None))
-
         else:
-            raise NotImplementedError("Fused attention is only supported on TPU and CPU")
+            query, key, value = map(lambda x: x.astype(jnp.bfloat16), (query, key, value))
+            kv = jnp.stack([key, value], axis=2)
 
-        if self.attention_softmax_in_fp32:
-            attn_weights = attn_weights.astype(self.dtype)
+            attn_output = te_attn.cross_fused_attn(
+                query,
+                kv,
+                None,
+                attention_mask,
+                None,
+                attn_bias_type=te_attn.AttnBiasType.NO_BIAS,
+                attn_mask_type=te_attn.AttnMaskType.PADDING_CAUSAL_MASK,
+                scaling_factor=1.0 / math.sqrt(query.shape[-1]),
+                dropout_probability=self.config.attention_dropout,
+                is_training=not deterministic,
+            )
 
-        attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_states)
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
 
@@ -309,7 +290,6 @@ class FlaxMistralAttention(nn.Module):
         return outputs
 
 
-# Copied from transformers.models.llama.modeling_flax_llama.FlaxLlamaDecoderLayer with Llama->Mistral
 class FlaxMistralDecoderLayer(nn.Module):
     config: MistralConfig
     dtype: jnp.dtype = jnp.float32
@@ -494,7 +474,6 @@ class FlaxMistralPreTrainedModel(FlaxPreTrainedModel):
         return outputs
 
 
-# Copied from transformers.models.llama.modeling_flax_llama.FlaxLlamaLayerCollection with Llama->Mistral
 class FlaxMistralLayerCollection(nn.Module):
     config: MistralConfig
     dtype: jnp.dtype = jnp.float32
@@ -541,7 +520,6 @@ class FlaxMistralLayerCollection(nn.Module):
         return outputs
 
 
-# Copied from transformers.models.llama.modeling_flax_llama.FlaxLlamaModule with Llama->Mistral
 class FlaxMistralModule(nn.Module):
     config: MistralConfig
     dtype: jnp.dtype = jnp.float32
@@ -676,4 +654,3 @@ class FlaxMistralForCausalLM(FlaxMistralPreTrainedModel):
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
         return model_kwargs
-

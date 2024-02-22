@@ -23,6 +23,12 @@ from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel
 from transformers.utils import logging
 from transformers import LlamaConfig
 
+try:
+    from transformer_engine.jax import fused_attn as te_attn
+    _te_available = True
+except ImportError:
+    _te_available = False
+
 logger = logging.get_logger(__name__)
 
 
@@ -128,7 +134,6 @@ class FlaxLlamaAttention(nn.Module):
         return jnp.repeat(hidden_states, times, axis=axis)
 
     @nn.compact
-    # Copied from transformers.models.gpt_neo.modeling_flax_gpt_neo.FlaxGPTNeoSelfAttention._concatenate_to_cache
     def _concatenate_to_cache(self, key, value, query, attention_mask):
         """
         This function takes projected key, value states from a single input token and concatenates the states to cached
@@ -186,31 +191,30 @@ class FlaxLlamaAttention(nn.Module):
             value = self.repeat_hidden_states(value, self.num_heads // self.num_kv_heads)
 
         key, query = self.rotary_emb(key, query, position_ids)
+        
+        query_length, key_length = query.shape[1], key.shape[1]
 
+        if self.has_variable("cache", "cached_key"):
+            mask_shift = self.variables["cache"]["cache_index"]
+            max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
+            causal_mask = lax.dynamic_slice(
+                self.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
+            )
+        else:
+            causal_mask = self.causal_mask[:, :, :query_length, :key_length]
 
-        if not self.fused_attention or query.shape[1] < 256:
-            query_length, key_length = query.shape[1], key.shape[1]
+        batch_size = hidden_states.shape[0]
+        causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
 
-            if self.has_variable("cache", "cached_key"):
-                mask_shift = self.variables["cache"]["cache_index"]
-                max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
-                causal_mask = lax.dynamic_slice(
-                    self.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
-                )
-            else:
-                causal_mask = self.causal_mask[:, :, :query_length, :key_length]
+        attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+        attention_mask = combine_masks(attention_mask, causal_mask)
 
-            batch_size = hidden_states.shape[0]
-            causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
+        # During fast autoregressive decoding, we feed one position at a time,
+        # and cache the keys and values step by step.
+        if self.has_variable("cache", "cached_key") or init_cache:
+            key, value, attention_mask = self._concatenate_to_cache(key, value, query, attention_mask)
 
-            attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
-            attention_mask = combine_masks(attention_mask, causal_mask)
-
-            # During fast autoregressive decoding, we feed one position at a time,
-            # and cache the keys and values step by step.
-            if self.has_variable("cache", "cached_key") or init_cache:
-                key, value, attention_mask = self._concatenate_to_cache(key, value, query, attention_mask)
-
+        if not self.fused_attention or query.shape[1] < 256 or not _te_available:
             # transform boolean mask into float mask
             attention_bias = lax.select(
                 attention_mask > 0,
@@ -226,38 +230,28 @@ class FlaxLlamaAttention(nn.Module):
                 bias=attention_bias,
                 deterministic=deterministic,
                 dtype=attention_dtype,
-                # precision=jax.lax.Precision.DEFAULT,
             )
             
             if self.attention_softmax_in_fp32:
                 attn_weights = attn_weights.astype(self.dtype)
             
-            # attn_weights = self.drop(attn_weights)
-
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
             
         else:
             query, key, value = map(lambda x: x.astype(jnp.bfloat16), (query, key, value))
-            mesh = mesh_lib.thread_resources.env.physical_mesh
-
-            @partial(
-                shard_map,
-                mesh=mesh,
-                in_specs=(PS('data', None, 'model', None), PS('data', None, 'model', None), PS('data', None, 'model', None)),
-                out_specs=PS('data', None, 'model', None),
-                check_rep=False
+            qkv = jnp.stack((query, key, value), axis=2)
+                        
+            attn_output = te_attn.self_fused_attn(
+                qkv,
+                None,
+                attention_mask,
+                None,
+                attn_bias_type=te_attn.AttnBiasType.NO_BIAS,
+                attn_mask_type=te_attn.AttnMaskType.PADDING_CAUSAL_MASK,
+                scaling_factor=1.0 / math.sqrt(query.shape[-1]),
+                dropout_probability=self.config.attention_dropout,
+                is_training=not deterministic,
             )
-            def attn_fn(query, key, value):
-                return attn_ops.mha(
-                    query,
-                    key,
-                    value,
-                    None,
-                    sm_scale=1.0 / math.sqrt(query.shape[-1]),
-                    causal=True,
-                    block_k=32,
-                )
-            attn_output = attn_fn(query, key, value)
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
@@ -344,7 +338,6 @@ class FlaxLlamaDecoderLayer(nn.Module):
         return (hidden_states,) + outputs[1:]
 
 
-# Copied from transformers.models.gpt_neo.modeling_flax_gpt_neo.FlaxGPTNeoPreTrainedModel with GPTNeo->Llama, GPT_NEO->LLAMA, transformer->model
 class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained

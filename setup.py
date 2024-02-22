@@ -1,10 +1,9 @@
-from setuptools import setup, find_packages
+from setuptools import setup, find_packages, find_namespace_packages
 
 setup(
     name='magix',
     version='0.0.1',
-    packages=find_packages('magix'),
-    package_dir={'': 'magix'},
+    packages=find_namespace_packages(include=['magix*']),
     license='Apache 2.0',
     author='Luyu Gao',
     author_email='luyug@cs.cmu.edu',
