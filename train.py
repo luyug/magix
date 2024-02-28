@@ -7,6 +7,19 @@ from tqdm import tqdm, trange
 from functools import partial
 
 import jax
+if jax.default_backend() == 'gpu':
+    os.environ['XLA_FLAGS'] = (
+    # '--xla_gpu_enable_triton_softmax_fusion=true '
+    '--xla_gpu_triton_gemm_any=false '
+    '--xla_gpu_enable_async_collectives=true '
+    '--xla_gpu_enable_async_all_gather=true '
+    '--xla_gpu_enable_async_reduce_scatter=true '
+    '--xla_gpu_enable_latency_hiding_scheduler=true '
+    '--xla_gpu_enable_highest_priority_async_stream=true '
+    '--xla_gpu_collective_permute_decomposer_threshold=1024 '
+    '--xla_gpu_all_reduce_combine_threshold_bytes=51200 '
+    '--xla_gpu_simplify_all_fp_conversions=true '
+)
 import jax.numpy as jnp
 import optax
 import flax
@@ -109,6 +122,7 @@ class TrainArgs:
 class ModelArgs:
     model_type: str = 'llama'
     model_name: str = None
+    tokenizer_name: str = None
     model_cache_dir: str = None
     mesh_shape: List[int] = list_field(-1, 1)
 
@@ -137,8 +151,8 @@ def main():
             train_args.train_data_config
         )['train']
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name,
-        add_eos_token=True, use_fast=True, padding_side='left', legacy=False)
+        model_args.tokenizer_name,
+        add_eos_token=True, use_fast=True, padding_side='right', legacy=False)
     tokenizer.pad_token = tokenizer.eos_token
     train_dataset = TrainDataset(train_data, tokenizer, max_len=train_args.max_length)
     
@@ -184,14 +198,13 @@ def main():
     def train_step(params, opt_state, batch, dropout_rng):
         def compute_loss(params, batch):
             input_ids = batch['input_ids']
-            attention_mask = batch['attention_mask']
+            attention_mask = jnp.logical_and(batch['attention_mask'][:,:-1], batch['attention_mask'][:,1:]).astype('bool')
             logits = model(
-                input_ids=input_ids[:,:-1], attention_mask=attention_mask[:,:-1],
+                input_ids=input_ids[:,:-1], attention_mask=attention_mask,
                 params=params, train=True, dropout_rng=dropout_rng)[0]
             target_ids = input_ids[:,1:]
-            target_mask = attention_mask[:,1:]
             loss = optax.softmax_cross_entropy_with_integer_labels(logits, target_ids)
-            loss = loss * target_mask / target_mask.sum()
+            loss = loss * attention_mask / attention_mask.sum()
             loss = loss.sum()
             return loss
 

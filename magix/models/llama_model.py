@@ -99,7 +99,7 @@ class FlaxLlamaAttention(nn.Module):
     dtype: jnp.dtype = jnp.float32
     causal: bool = True
     is_cross_attention: bool = False
-    fused_attention: bool = False
+    fused_attention: bool = True
 
     def setup(self):
         config = self.config
@@ -207,21 +207,21 @@ class FlaxLlamaAttention(nn.Module):
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
 
         attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
-        attention_mask = combine_masks(attention_mask, causal_mask)
 
         # During fast autoregressive decoding, we feed one position at a time,
         # and cache the keys and values step by step.
         if self.has_variable("cache", "cached_key") or init_cache:
             key, value, attention_mask = self._concatenate_to_cache(key, value, query, attention_mask)
 
-        if not self.fused_attention or query.shape[1] < 256 or not _te_available:
+        if not self.fused_attention or query.shape[1] < 32 or not _te_available:
+            attention_mask = combine_masks(attention_mask, causal_mask)  # make fp mask
             # transform boolean mask into float mask
             attention_bias = lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
                 jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
-
+            
             # usual dot product attention
             attention_dtype = jnp.float32 if self.attention_softmax_in_fp32 else self.dtype
             attn_weights = dot_product_attention_weights(
@@ -238,6 +238,8 @@ class FlaxLlamaAttention(nn.Module):
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
             
         else:
+            attention_mask = ~combine_masks(attention_mask, causal_mask, dtype='bool')  # make bool mask
+            
             query, key, value = map(lambda x: x.astype(jnp.bfloat16), (query, key, value))
             qkv = jnp.stack((query, key, value), axis=2)
                         

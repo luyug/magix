@@ -27,7 +27,7 @@ class GenerateArgs:
     sample: bool = False
     tempearature: float = 0.7
     seed: int = 42
-    max_length: int = 512
+    max_length: int = 256
     model_type: str = 'llama'
     model_name_or_path: str = None
     model_config_name: Optional[str] = None
@@ -131,10 +131,12 @@ def main():
                     sample=args.sample,
                     tempearature=args.tempearature,
                 )
+                print(generated, flush=True)
                 generated = tokenizer.batch_decode(
                     generated, skip_special_tokens=True)
                 for g in generated[:batch_size]:
-                    f.write(g + '\n')
+                    f.write(g + '\n',)
+                    f.flush()
 
 if __name__ == "__main__":
     main()

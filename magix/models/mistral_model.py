@@ -133,7 +133,7 @@ def flax_repeat_kv(hidden_states: jnp.ndarray, n_rep: int) -> jnp.ndarray:
 class FlaxMistralAttention(nn.Module):
     config: MistralConfig
     dtype: jnp.dtype = jnp.float32
-    fused_attention: bool = False
+    fused_attention: bool = True
 
     def setup(self):
         config = self.config
@@ -230,14 +230,22 @@ class FlaxMistralAttention(nn.Module):
         batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
         attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
-        attention_mask = combine_masks(attention_mask, causal_mask)
+        attention_mask = combine_masks(attention_mask, causal_mask, dtype="bool")
 
         if self.has_variable("cache", "cached_key") or init_cache:
             key_states, value_states, attention_mask = self._concatenate_to_cache(
                 key_states, value_states, query_states, attention_mask
             )
+            
+        use_fused_attention = (
+            self.fused_attention 
+            and _te_available 
+            and query_length >= 32 
+            and not init_cache
+            and not self.has_variable("cache", "cached_key")
+        )
 
-        if not self.fused_attention or query_length < 65 or not _te_available:
+        if not use_fused_attention:
             attention_bias = lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -267,14 +275,14 @@ class FlaxMistralAttention(nn.Module):
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_states)
             
         else:
-            query, key, value = map(lambda x: x.astype(jnp.bfloat16), (query, key, value))
+            query, key, value = map(lambda x: x.astype(jnp.bfloat16), (query_states, key_states, value_states))
             kv = jnp.stack([key, value], axis=2)
 
             attn_output = te_attn.cross_fused_attn(
                 query,
                 kv,
                 None,
-                attention_mask,
+                ~attention_mask,
                 None,
                 attn_bias_type=te_attn.AttnBiasType.NO_BIAS,
                 attn_mask_type=te_attn.AttnMaskType.PADDING_CAUSAL_MASK,
