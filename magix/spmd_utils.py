@@ -8,14 +8,18 @@ import jax
 from jax.sharding import PartitionSpec as PS
 from jax.sharding import NamedSharding, Mesh
 from jax.experimental import mesh_utils
-
+from jax._src.tree_util import GetAttrKey
 
 logger = logging.getLogger(__name__)
 
 
 def get_sharding(k, v, sharding_config=None, mesh=None):
     def get_key(x):
-        return str(getattr(x, 'key', getattr(x, 'idx', None)))
+        if isinstance(x, GetAttrKey):
+            name = str(x)[1:]
+        else:
+            name = str(getattr(x, 'key', getattr(x, 'idx', None)))
+        return name
     
     path = '/'.join([get_key(p) for p in k])
     rule = PS(None)
@@ -25,6 +29,9 @@ def get_sharding(k, v, sharding_config=None, mesh=None):
             break
     if len(v.shape) == 0:
         rule = PS()
+    
+    if mesh is None:
+        return rule
 
     return NamedSharding(mesh, rule)
 

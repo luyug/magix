@@ -614,7 +614,7 @@ class FlaxGemmaForCausalLMModule(nn.Module):
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             use_bias=False,
-            dtype=self.dtype,
+            dtype=jnp.bfloat16,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
         )
 
