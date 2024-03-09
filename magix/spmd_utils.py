@@ -60,3 +60,10 @@ def create_device_mesh(shape, names=('data', 'model')):
         shape = np.array(jax.devices()).reshape(shape).shape
 
     return Mesh(devices=mesh_utils.create_device_mesh(shape), axis_names=names)
+
+
+def duplicate_over(ob, *dup_axes):
+    def transform_spec(spec):
+        new_axes = [ax if ax not in dup_axes else None for ax in spec]
+        return PS(*new_axes)
+    return jax.tree_map(transform_spec, ob, is_leaf=lambda x: isinstance(x, PS))
