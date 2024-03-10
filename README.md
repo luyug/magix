@@ -26,18 +26,18 @@ from magix.models.llama_model import FlaxLlamaForCausalLM
 mesh = magix.create_device_mesh((2,2), names=('data', 'model'))
 ```
 
-3. For the next step we will load our model onto the mesh, each device will hold a part (shard) of the full model. Instead of the familiar `from_pretrain`, we will use the function `magix.load_model_hub` function which will call `from_pretrained` internally but also place the model correctly.
+3. For the next step we will load our model onto the mesh, each device will hold a part (shard) of the full model. Instead of the familiar `from_pretrained`, we will use the function `magix.load_model_hub` function which will call `from_pretrained` internally but also place the model correctly.
 ```
 model, params = magix.load_model_hub(
   FlaxLlamaForCausalLM,
-  'meta-llama/Llama-2-7b',
+  'meta-llama/Llama-2-13b',
   FlaxLlamaForCausalLM.partition_rules,  # use the pre-defined partitioning
   mesh
 )
 ```
 Here `params` is partitioned and placed on to the mesh. As a side note, JAX will reason about model definition and parameter seperately, analogous to `y = f(x|θ)`
 
-4. For training, you will also need to do build the optimizer states onto the mesh,
+4. For training, you will also need to do something simlar and build the optimizer states onto the mesh,
 ```
 opt_state = magix.initialize_opt_state(optimizer, params, sharding_config, mesh)
 ```
