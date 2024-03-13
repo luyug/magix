@@ -56,7 +56,7 @@ With all these, you are ready to start your training/inference loop.
 Take a look at the complete scripts in [train.py](https://github.com/luyug/magix/blob/main/train.py), [train_lora.py](https://github.com/luyug/magix/blob/main/train_lora.py) and [generate.py](https://github.com/luyug/magix/blob/main/generate.py).
 
 ## Example: Train a Mistral ChatBot with Lora and Data&Tensor Parallelism
-Assume we have 4 GPUs. Let's train `mistral-7b` on `UltraChat` with data and tensor parallism, `dp=2` and `tp=2`:
+Assume we have 4 GPUs. Let's train `mistral-7b` on `UltraChat` with data and tensor parallism, `dp=2` and `tp=2` (`mesh_shape=2 2`):
 ```
 python train_lora.py \
     --checkpoint_dir /absolute/path/to/checkpoint \
@@ -75,7 +75,7 @@ python train_lora.py \
     --weight_decay 0.001 \
     --max_length 1024
 ```
-After training, let's solve some math problems. Do generation with full tensor parallel `tp=4`:
+After training, let's solve some math problems. Do generation with full tensor parallel `tp=4` (`mesh_shape=1 -1`):
 ```
 python generate.py \
     --prompts gsm8k \
@@ -85,7 +85,7 @@ python generate.py \
     --data_field question \
     --output_file generation.jsonl \
     --mesh_shape 1 -1  \
-    --model_type llama \
+    --model_type mistral \
     --model_name_or_path mistralai/Mistral-7B-v0.1 \
     --tokenizer_name_or_path mistralai/Mistral-7B-v0.1 \
     --model_config_name mistralai/Mistral-7B-v0.1 \
