@@ -77,6 +77,15 @@ def load_by_sharding(
     return restored
 
 
+def load_by_sharding_no_manager(sharding, path):
+    checkpointer = orbax.checkpoint.Checkpointer(orbax.checkpoint.PyTreeCheckpointHandler())
+    restored = checkpointer.restore(
+        path,
+        restore_args=array_restore_args_from_sharding_pytree(sharding)
+    )
+    return restored
+
+
 def load_model_and_optimizer_local(
     model_cls,
     optimizer,

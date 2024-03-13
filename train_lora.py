@@ -40,27 +40,45 @@ from magix import (
     load_model_hub,
 )
 
+def apply_chat_template(turns: Iterable[Dict[str, str]], eos_token: str = None):
+    ROLE_DICT = {
+        'user': '<|user|>',
+        'assistant': '<|assistant|>',
+        'system': '<|system|>',
+    }
+    def _format(turn):
+        role, content = turn['role'], turn['content']
+        return f"{ROLE_DICT[role]}\n{content}{eos_token}"
+    
+    return '\n'.join(_format(turn) for turn in turns)
+
 
 class TrainDataset:
     def __init__(
         self,
         train_data,
         tokenizer,
+        field_name: str = 'text',
         max_len: int = 1024,
+        use_chat_template: bool = False,
     ):
         self.data = train_data
         self.tokenizer = tokenizer
+        self.field_name = field_name
         self.max_len = max_len
+        self.use_chat_template = use_chat_template
         
     def __len__(self):
         return len(self.data)
 
     def get_batch(self, indices):
         batch = self.data[indices]
-        batch = batch['text']
+        batch = batch[self.field_name]
+        if self.use_chat_template:
+            batch = [apply_chat_template(turns, eos_token=self.tokenizer.eos_token) for turns in batch]
         tokenized = self.tokenizer(
             batch, max_length=self.max_len+1, padding='max_length',
-            truncation=True, return_tensors='np'
+            truncation=True, return_tensors='np',
         )
         return dict(tokenized)
 
@@ -101,6 +119,9 @@ def decay_mask_fn(params):
 class TrainArgs:
     train_file: str = None
     train_data_config: str = None
+    train_data_field: str = 'text'
+    split: str = 'train'
+    use_chat_template: bool = False
     checkpoint_dir: str = None
     max_length: int = 1024
     num_epochs: int = 1
@@ -125,6 +146,7 @@ class ModelArgs:
     tokenizer_name: str = None
     model_cache_dir: str = None
     mesh_shape: List[int] = list_field(-1, 1)
+    bf16_model_weights: bool = False
 
 def main():
     parser = ArgumentParser()
@@ -149,12 +171,13 @@ def main():
         train_data = datasets.load_dataset(
             train_args.train_file,
             train_args.train_data_config
-        )['train']
+        )[train_args.split]
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name,
-        add_eos_token=True, use_fast=True, padding_side='right', legacy=False)
+        add_eos_token=not train_args.use_chat_template,
+        use_fast=True, padding_side='right', legacy=False)
     tokenizer.pad_token = tokenizer.eos_token
-    train_dataset = TrainDataset(train_data, tokenizer, max_len=train_args.max_length)
+    train_dataset = TrainDataset(train_data, tokenizer, train_args.train_data_field, train_args.max_length, train_args.use_chat_template)
     
     # optimizer setup
     total_train_steps = len(train_dataset) // train_args.batch_size * train_args.num_epochs
@@ -193,7 +216,17 @@ def main():
     sharding_config = _model_cls.partition_rules
     
     logger.info("Loading model from hub")
-    model, params = load_model_hub(_model_cls, model_args.model_name, sharding_config, mesh, half=True)
+    if model_args.model_cache_dir and os.path.exists(model_args.model_cache_dir):
+        model, params = magix.checkpoint_utils.load_model_local(
+            _model_cls,
+            model_args.model_cache_dir,
+            sharding_config,
+            mesh,
+            model_name=model_args.model_name,
+        )
+    else:
+        model, params = load_model_hub(_model_cls, model_args.model_name, sharding_config, mesh, half=model_args.bf16_model_weights)
+        # magix.checkpoint_utils.save_model_local(params, model_args.model_cache_dir)
     
     rng = jax.random.key(train_args.seed)
     dropout_rng, data_rng, lora_rng = jax.random.split(rng, 3)
@@ -211,12 +244,13 @@ def main():
         lora_state = jax.jit(lora.init_params, out_shardings=lora_sharding) (lora_rng, params)
         opt_state = jax.jit(optimizer.init, out_shardings=opt_sharding)(lora_state)
     else:
-        lora_state, opt_state = magix.checkpoint_utils.load_by_sharding(
+        loaded = magix.checkpoint_utils.load_by_sharding(
             checkpoint_manager,
             items=['lora', 'optimizer'],
             dummies=[lora_state_shapes, opt_shapes],
             shardings=[lora_sharding, opt_sharding]
         )
+        lora_state, opt_state = loaded['lora'], loaded['optimizer']
     
 
     def train_step(params, lora_state, opt_state, batch, dropout_rng):
@@ -308,6 +342,7 @@ def main():
             epochs.write(
                     f"Epoch... ({epoch + 1}/{train_args.num_epochs})"
                 )
+    checkpoint_manager.wait_until_finished()
 
 if __name__ == '__main__':
     main()

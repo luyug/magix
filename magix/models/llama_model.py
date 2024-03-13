@@ -12,6 +12,7 @@ from jax.sharding import Mesh, PartitionSpec as PS
 from jax.experimental.pallas.ops import attention as attn_ops
 from jax.experimental.shard_map import shard_map
 from jax._src import mesh as mesh_lib
+import jax.experimental.pallas.ops.tpu.flash_attention as tpu_attn_ops
 import flax.linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
@@ -212,8 +213,16 @@ class FlaxLlamaAttention(nn.Module):
         # and cache the keys and values step by step.
         if self.has_variable("cache", "cached_key") or init_cache:
             key, value, attention_mask = self._concatenate_to_cache(key, value, query, attention_mask)
+        
+        use_fused_attention = (
+            self.fused_attention 
+            and _te_available 
+            and query_length >= 32 
+            and not init_cache
+            and not self.has_variable("cache", "cached_key")
+        )
 
-        if not self.fused_attention or query.shape[1] < 32 or not _te_available:
+        if not use_fused_attention:
             attention_mask = combine_masks(attention_mask, causal_mask)  # make fp mask
             # transform boolean mask into float mask
             attention_bias = lax.select(

@@ -1,5 +1,6 @@
 import os
 import logging
+import json
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -10,18 +11,25 @@ import jax
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as PS
 from jax.sharding import NamedSharding
-from flax.training.common_utils import onehot
+import orbax.checkpoint
 
+import datasets
 from transformers import AutoTokenizer, AutoConfig
 from simple_parsing import ArgumentParser
 from simple_parsing.helpers import list_field
 
 import magix
 import magix.models
+import magix.lora
 
 @dataclass
 class GenerateArgs:
     prompts: str = None
+    use_chat_template: bool = False
+    data_field : str = 'prompt'
+    hf_data_config: str = None
+    hf_data_split: str = 'test'
+    output_file: str = 'generated.txt'
     batch_size: int = 32
     pad_to_multiple_of: int = 64
     sample: bool = False
@@ -34,6 +42,8 @@ class GenerateArgs:
     tokenizer_name_or_path: str = None
     mesh_shape: List[int] = list_field(1, -1)
     hf_format: bool = False
+    lora: str = None
+    lora_alpha: float = 32.0
 
 def main():
     parser = ArgumentParser()
@@ -73,6 +83,25 @@ def main():
             model_config=AutoConfig.from_pretrained(args.model_config_name),
         )
         
+    if args.lora is not None:
+        lora = magix.lora.Lora(
+            args.lora_alpha,
+            rules={
+                'layers/.*/kernel': 1,  # rank place holder
+            }
+        )
+        # infer the lora parameters
+        lora_params_absract = jax.eval_shape(lora.init_params, jax.random.PRNGKey(0), params)
+        lora_params_sharding = magix.lora.create_lora_sharding(_model_cls.partition_rules, mesh, lora_params_absract)
+        lora_params = magix.checkpoint_utils.load_by_sharding_no_manager(lora_params_sharding, args.lora)
+        params = jax.jit(
+            lora.apply,
+            donate_argnums=(0,),
+            in_shardings=(magix.item_sharding(params), magix.item_sharding(lora_params)),
+            out_shardings=magix.item_sharding(params)
+            ) (params, lora_params)
+        del lora_params
+        
     def tokenize(batch):
         return tokenizer(
             batch,
@@ -109,13 +138,25 @@ def main():
         new_rng_key, _ = jax.random.split(rng_key)
         
         return generation, new_rng_key
-        
-    with open(args.prompts, 'r') as f:
-        prompts = f.readlines()
+    
+    if args.prompts.endswith('.txt'):    
+        with open(args.prompts, 'r') as f:
+            prompts = [l.strip() for l in f]
+    elif args.prompts.endswith('.jsonl'):
+        with open(args.prompts, 'r') as f:
+            prompts = [json.loads(l)[args.data_field] for l in f]
+    else:
+        prompts = datasets.load_dataset(
+            args.prompts, args.hf_data_config
+        )[args.hf_data_split][args.data_field][:1000]
+    
+    if args.use_chat_template:
+        CHAT_FORMAT = '<|user|>\n{prompt}{eos}<|assistant|>\n'
+        prompts = [CHAT_FORMAT.format(prompt=p, eos=tokenizer.eos_token) for p in prompts]
     
     rng_key = jax.random.PRNGKey(args.seed)
     
-    with open('generated.txt', 'w') as f:
+    with open(args.output_file, 'w') as f:
         with mesh:
             for i in trange(0, len(prompts), args.batch_size):
                 batch = prompts[i:i+args.batch_size]
@@ -131,12 +172,12 @@ def main():
                     sample=args.sample,
                     tempearature=args.tempearature,
                 )
-                print(generated, flush=True)
+                input_seq_len = batch['input_ids'].shape[1]
+                generated = generated[:, input_seq_len:]
                 generated = tokenizer.batch_decode(
                     generated, skip_special_tokens=True)
-                for g in generated[:batch_size]:
-                    f.write(g + '\n',)
-                    f.flush()
+                for p, g in zip(prompts[i:i+batch_size], generated):
+                    f.write(json.dumps({'prompt': p, 'generated': g}) + '\n')
 
 if __name__ == "__main__":
     main()

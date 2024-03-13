@@ -13,5 +13,6 @@ setup(
         'datasets>=1.1.3',
         'simple_parsing',
         'sentencepiece',
+        'orbax-checkpoint==0.4.8',
     ]
 )

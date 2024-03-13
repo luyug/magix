@@ -94,6 +94,7 @@ class FlaxGemmaAttention(nn.Module):
     config: GemmaConfig
     dtype: jnp.dtype = jnp.float32
     causal: bool = True
+    fused_attention: bool = True
 
     def setup(self):
         config = self.config
@@ -107,21 +108,29 @@ class FlaxGemmaAttention(nn.Module):
 
         kernel = jax.nn.initializers.normal(self.config.initializer_range)
         self.q_proj = nn.Dense(
-            self.num_heads * self.head_dim, use_bias=config.attention_bias, dtype=self.dtype, kernel_init=kernel
+            self.num_heads * self.head_dim,
+            use_bias=config.attention_bias,
+            dtype=jnp.bfloat16,
+            kernel_init=kernel
         )
         self.k_proj = nn.Dense(
             self.num_key_value_heads * self.head_dim,
             use_bias=config.attention_bias,
-            dtype=self.dtype,
+            dtype=jnp.bfloat16,
             kernel_init=kernel,
         )
         self.v_proj = nn.Dense(
             self.num_key_value_heads * self.head_dim,
             use_bias=config.attention_bias,
-            dtype=self.dtype,
+            dtype=jnp.bfloat16,
             kernel_init=kernel,
         )
-        self.o_proj = nn.Dense(self.embed_dim, use_bias=config.attention_bias, dtype=self.dtype, kernel_init=kernel)
+        self.o_proj = nn.Dense(
+            self.embed_dim,
+            use_bias=config.attention_bias,
+            dtype=jnp.bfloat16,
+            kernel_init=kernel
+        )
 
         self.causal_mask = make_causal_mask(jnp.ones((1, config.max_position_embeddings), dtype="bool"), dtype="bool")
         self.rotary_emb = FlaxGemmaRotaryEmbedding(config, dtype=self.dtype)
@@ -285,9 +294,9 @@ class FlaxGemmaMLP(nn.Module):
         kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
         self.act = ACT2FN[self.config.hidden_act]
 
-        self.gate_proj = nn.Dense(inner_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init)
-        self.down_proj = nn.Dense(embed_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init)
-        self.up_proj = nn.Dense(inner_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init)
+        self.gate_proj = nn.Dense(inner_dim, use_bias=False, dtype=jnp.bfloat16, kernel_init=kernel_init)
+        self.down_proj = nn.Dense(embed_dim, use_bias=False, dtype=jnp.bfloat16, kernel_init=kernel_init)
+        self.up_proj = nn.Dense(inner_dim, use_bias=False, dtype=jnp.bfloat16, kernel_init=kernel_init)
 
     def __call__(self, hidden_states):
         up_proj_states = self.up_proj(hidden_states)
@@ -357,7 +366,7 @@ class FlaxGemmaPreTrainedModel(FlaxPreTrainedModel):
     module_class: nn.Module = None
     
     partition_rules = {
-        'embed_tokens/embedding': PS('data', 'model'),
+        'embed_tokens/embedding': PS('model', 'data'),
         'lm_head': PS('data', 'model'),
         'mlp/(gate|up)_proj': PS('data', 'model'),
         'mlp/down_proj': PS('model', 'data'),

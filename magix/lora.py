@@ -36,6 +36,8 @@ def create_lora_sharding(sharding_config, mesh, lora_abs):
 def adapt_params(params, lora_states, alpha=32):
     def adapt_one_param(p, l):
         if l is not None:
+            if isinstance(l, dict):
+                l = LoraPair(l['in_matrix'], l['out_matrix'])
             l = tuple(map(lambda x: jnp.astype(x, jnp.bfloat16), l))
             return p + (alpha / l[0].shape[1])*jnp.matmul(l[0], l[1])
         return p
