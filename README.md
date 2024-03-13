@@ -5,7 +5,7 @@ Magix is a mininalist toolkit for training LLM with flexible data and model para
 - Training Billion-scale LLM on GPUs or TPUs.
 - Familiar Huggingface interfaces.
 - Pre-defined model parallel (sharding) rules for popular models like Llama, Mistral, Gemma, etc.
-- Fast fused(flash) attention operations and 
+- Acceleration with flash attention operations and opration fusion.
 - Very fast checkpoint save/restore with arbirary device and parallism design.
 
 ## Magix 101
