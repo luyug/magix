@@ -148,7 +148,7 @@ def main():
     else:
         prompts = datasets.load_dataset(
             args.prompts, args.hf_data_config
-        )[args.hf_data_split][args.data_field][:1000]
+        )[args.hf_data_split][args.data_field]
     
     if args.use_chat_template:
         CHAT_FORMAT = '<|user|>\n{prompt}{eos}<|assistant|>\n'
