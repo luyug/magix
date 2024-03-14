@@ -99,4 +99,14 @@ python generate.py \
 We recommend using the jax-toolbox jax [container image](https://github.com/NVIDIA/JAX-Toolbox/pkgs/container/jax) from nvidia. We have example [Dockerfile](https://github.com/luyug/magix/blob/main/container/Dockerfile) and Singulrity [Definition File](https://github.com/luyug/magix/blob/main/container/magix-gpu.def).
 
 ## Runing on TPUs
-Follow the official [install guide](https://jax.readthedocs.io/en/latest/installation.html#pip-installation-google-cloud-tpu) is all you need.
+Install appropriate `jax` build, `torch-cpu` and then the rest of the dependencies.
+```
+pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+# get torch-cpu for model conversion
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+git clone https://github.com/luyug/magix.git
+cd magix
+pip install -e .
+```
