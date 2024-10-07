@@ -9,8 +9,9 @@ import numpy as np
 from jax import lax
 from jax.sharding import PartitionSpec as PS
 from jax._src import mesh as mesh_lib
-from jax.experimental.pallas.ops import attention as attn_ops
+from jax.ad_checkpoint import checkpoint_name
 from jax.experimental.shard_map import shard_map
+
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
@@ -24,7 +25,7 @@ from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append
 from transformers import MistralConfig
 
 try:
-    from transformer_engine.jax import fused_attn as te_attn
+    from transformer_engine.jax import attention as te_attn
     _te_available = True
 except ImportError:
     _te_available = False
@@ -55,7 +56,8 @@ class FlaxMistralRotaryEmbedding(nn.Module):
 
     def setup(self):
         head_dim = self.config.hidden_size // self.config.num_attention_heads
-        self.sincos = create_sinusoidal_positions(self.config.max_position_embeddings, head_dim)
+        self.sincos = create_sinusoidal_positions(
+            self.config.max_position_embeddings, head_dim, base=self.config.rope_theta)
 
     def __call__(self, key, query, position_ids):
         sincos = self.sincos[position_ids]
@@ -100,8 +102,8 @@ def apply_rotary_pos_emb(tensor, sin_pos, cos_pos):
     return (tensor * cos_pos) + (rotate_half(tensor) * sin_pos)
 
 
-def create_sinusoidal_positions(num_pos, dim):
-    inv_freq = 1.0 / (10000 ** (np.arange(0, dim, 2) / dim))
+def create_sinusoidal_positions(num_pos, dim, base=10000):
+    inv_freq = 1.0 / (base ** (np.arange(0, dim, 2) / dim))
     freqs = np.einsum("i , j -> i j", np.arange(num_pos), inv_freq).astype("float32")
 
     emb = np.concatenate((freqs, freqs), axis=-1)
@@ -154,10 +156,7 @@ class FlaxMistralAttention(nn.Module):
         self.k_proj = nn.Dense(self.num_key_value_heads * self.head_dim, use_bias=False, dtype=self.dtype)
         self.v_proj = nn.Dense(self.num_key_value_heads * self.head_dim, use_bias=False, dtype=self.dtype)
         self.o_proj = nn.Dense(self.hidden_size, use_bias=False, dtype=self.dtype)
-        self.causal_mask = jnp.triu(
-            make_causal_mask(jnp.ones((1, config.max_position_embeddings), dtype="bool"), dtype="bool"),
-            k=-config.sliding_window,
-        )
+        self.causal_mask = make_causal_mask(jnp.ones((1, config.max_position_embeddings), dtype="bool"), dtype="bool")
         self.rotary_emb = FlaxMistralRotaryEmbedding(config, dtype=jnp.float32)
 
     def _split_heads(self, hidden_states, num_heads):
@@ -276,20 +275,20 @@ class FlaxMistralAttention(nn.Module):
             
         else:
             query, key, value = map(lambda x: x.astype(jnp.bfloat16), (query_states, key_states, value_states))
-            kv = jnp.stack([key, value], axis=2)
 
-            attn_output = te_attn.cross_fused_attn(
-                query,
-                kv,
+            attn_output = te_attn.fused_attn(
+                (query, key, value),
                 None,
                 ~attention_mask,
                 None,
                 attn_bias_type=te_attn.AttnBiasType.NO_BIAS,
                 attn_mask_type=te_attn.AttnMaskType.PADDING_CAUSAL_MASK,
+                qkv_layout=te_attn.QKVLayout.BSHD_BSHD_BSHD,
                 scaling_factor=1.0 / math.sqrt(query.shape[-1]),
-                dropout_probability=self.config.attention_dropout,
+                dropout_probability=0,
                 is_training=not deterministic,
             )
+            attn_output = lax.with_sharding_constraint(attn_output, PS('data', None, 'model', None))
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
@@ -333,9 +332,12 @@ class FlaxMistralDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = hidden_states.astype(jnp.bfloat16)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = hidden_states.astype(jnp.bfloat16)
         # residual connection
         hidden_states = residual + hidden_states
+        hidden_states = hidden_states.astype(jnp.bfloat16)
 
         return (hidden_states,) + outputs[1:]
 
@@ -357,7 +359,7 @@ class FlaxMistralPreTrainedModel(FlaxPreTrainedModel):
         'mlp/down_proj': PS('model', 'data'),
         'self_attn/(k|q|v)_proj': PS('data', 'model'),
         'self_attn/o_proj': PS('model', 'data'),
-        'norm/weight': PS('model'),
+        # 'norm/weight': PS('model'),
     }
     
 
@@ -507,15 +509,17 @@ class FlaxMistralLayerCollection(nn.Module):
         all_hidden_states = () if output_hidden_states else None
 
         for block in self.blocks:
+            hidden_states = lax.with_sharding_constraint(hidden_states, PS('data', None, 'model'))
+            
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             layer_outputs = block(
                 hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                deterministic=deterministic,
-                init_cache=init_cache,
-                output_attentions=output_attentions,
+                attention_mask,
+                position_ids,
+                deterministic,
+                init_cache,
+                output_attentions,
             )
             hidden_states = layer_outputs[0]
 
@@ -539,7 +543,7 @@ class FlaxMistralModule(nn.Module):
             self.config.vocab_size,
             self.hidden_size,
             embedding_init=embedding_init,
-            dtype=self.dtype,
+            dtype=jnp.bfloat16,
         )
         self.layers = FlaxMistralLayerCollection(self.config, dtype=self.dtype)
         self.norm = FlaxMistralRMSNorm(self.config, dtype=self.dtype)
@@ -556,6 +560,7 @@ class FlaxMistralModule(nn.Module):
         return_dict: bool = True,
     ):
         input_embeds = self.embed_tokens(input_ids.astype("i4"))
+        input_embeds = lax.with_sharding_constraint(input_embeds, PS('data', None, 'model'))
 
         outputs = self.layers(
             input_embeds,
@@ -626,7 +631,9 @@ class FlaxMistralForCausalLMModule(nn.Module):
         )
 
         hidden_states = outputs[0]
+        hidden_states = lax.with_sharding_constraint(hidden_states, PS('data', None, 'model'))
         lm_logits = self.lm_head(hidden_states)
+        hidden_states = lax.with_sharding_constraint(hidden_states, PS('data', None, 'model'))
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]

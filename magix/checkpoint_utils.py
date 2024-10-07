@@ -4,7 +4,10 @@ import jax
 import logging
 from typing import Any, Iterable
 from functools import partial
+
 from jax.sharding import Mesh
+
+from flax.core import freeze, unfreeze
 
 from . import spmd_utils
 
@@ -77,15 +80,6 @@ def load_by_sharding(
     return restored
 
 
-def load_by_sharding_no_manager(sharding, path):
-    checkpointer = orbax.checkpoint.Checkpointer(orbax.checkpoint.PyTreeCheckpointHandler())
-    restored = checkpointer.restore(
-        path,
-        restore_args=array_restore_args_from_sharding_pytree(sharding)
-    )
-    return restored
-
-
 def load_model_and_optimizer_local(
     model_cls,
     optimizer,
@@ -142,6 +136,7 @@ def load_model_local(
     mesh,
     model_name=None,
     model_config=None,
+    half=False,
 ):
     # Create sharding function using sharding config over mesh
     get_sharding = partial(
@@ -165,9 +160,20 @@ def load_model_local(
     checkpointer = orbax.checkpoint.Checkpointer(orbax.checkpoint.PyTreeCheckpointHandler())
     params = checkpointer.restore(
         path,
-        restore_args=array_restore_args_from_sharding_pytree(model_sharding)
+        restore_args=unfreeze(array_restore_args_from_sharding_pytree(model_sharding))
     )
     logger.info("Model restored from local storage at %s", path)
+    
+    if half:
+        params = jax.jit(
+            model_no_init.to_bf16,
+            out_shardings=spmd_utils.item_sharding(params)
+        ) (params)
+    else:
+        params = jax.jit(
+            model_no_init.to_fp32,
+            out_shardings=spmd_utils.item_sharding(params)
+        ) (params)
     
     return model_no_init, params
 
@@ -183,7 +189,7 @@ def save_model_local(
 
 def get_chckpoint_manager(checkpoint_dir, save_steps=500, max_to_keep=3, items=['model', 'optimizer'], json_items=[]):
     options = orbax.checkpoint.CheckpointManagerOptions(
-        save_interval_steps=save_steps, max_to_keep=max_to_keep)
+        save_interval_steps=save_steps, max_to_keep=max_to_keep, enable_async_checkpointing=False)
     def get_checkpointer():
         return orbax.checkpoint.AsyncCheckpointer(orbax.checkpoint.PyTreeCheckpointHandler())
     def get_json_checkpointer():

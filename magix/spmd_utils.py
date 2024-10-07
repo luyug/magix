@@ -36,6 +36,13 @@ def get_sharding(k, v, sharding_config=None, mesh=None):
     return NamedSharding(mesh, rule)
 
 
+def get_sharding_tree(pytree, sharding_config, mesh=None):
+    return jax.tree_util.tree_map_with_path(
+        partial(get_sharding, sharding_config=sharding_config, mesh=mesh),
+        pytree
+    )
+
+
 def item_sharding(pytree):
     return jax.tree_map(lambda x: x.sharding, pytree)
 
