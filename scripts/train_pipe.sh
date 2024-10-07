@@ -5,7 +5,7 @@ export NCCL_DEBUG=WARN
 
 
 python ./convert_hf_to_jax.py \
-    --model_name meta-llama/Llama-3.1-8B \
+    --model_name meta-llama/Meta-Llama-3-70B \
     --model_type llama \
     --save_path ./model-jax/Meta-Llama-3-70B-scan \
     --make_scan_param
