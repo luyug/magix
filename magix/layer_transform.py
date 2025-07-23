@@ -1,3 +1,4 @@
+import jax
 import flax.linen as nn
 
 def make_scan_fwd_layer(layer_cls, **kwargs):
@@ -27,10 +28,15 @@ def make_scan_bwd_layer(layer_cls, **kwargs):
 def make_scan_stack(layer_cls, length=None, remat=False, **layer_kwargs):
     scan_layer = make_scan_fwd_layer(layer_cls, **layer_kwargs)
     if remat:
-        scan_layer = nn.remat(scan_layer)
+        scan_layer = nn.remat(
+            scan_layer,
+            prevent_cse=False,
+            # policy=jax.checkpoint_policies.save_only_these_names('q','k', 'v', 'o', 'down_proj'),
+            # policy=jax.checkpoint_policies.save_only_these_names('q','k', 'v', 'o', 'down_proj', 'up_proj', 'gate_proj'),
+        )
     return nn.scan(
         scan_layer,
         length=length,
-        variable_axes={"params": 0},
+        variable_axes={"params": 0, "cache": 0},
         split_rngs={"params": True}
     )

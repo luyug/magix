@@ -42,7 +42,7 @@ def load_model_hub(
     
     # Load model from hub
     with jax.default_device(jax.local_devices(backend="cpu")[0]):
-        with Mesh(devices = np.array(jax.local_devices(backend='cpu')[0]).reshape(1,1), axis_names=('data', 'model')):
+        with Mesh(devices = np.array(jax.local_devices(backend='cpu')[0]).reshape(1,1,1), axis_names=('data', 'seq', 'model')):
             model = model_cls.from_pretrained(model_name, ignore_mismatched_sizes=ignore_mismatched_sizes,from_pt=from_pt)
             if not half:
                 model.params = model.to_fp32(model.params)
@@ -102,7 +102,7 @@ def load_model_and_optimizer_local(
         model_config = model_cls.config_class.from_pretrained(model_name)
     
     # Create model instance and get shape pytrees for model and optimizer
-    with Mesh(devices = np.array(jax.devices('cpu')[0]).reshape(1,1), axis_names=('data', 'model')):
+    with Mesh(devices = np.array(jax.local_devices(backend='cpu')[0]).reshape(1,1,1), axis_names=('data', 'seq', 'model')):
         model_no_init = model_cls(model_config, _do_init=False)
     
         def opt_shape():
@@ -150,7 +150,7 @@ def load_model_local(
         model_config = model_cls.config_class.from_pretrained(model_name)
     
     # Create model instance and get shape pytrees for model and optimizer
-    with Mesh(devices = np.array(jax.devices('cpu')[0]).reshape(1,1), axis_names=('data', 'model')):
+    with Mesh(devices = np.array(jax.local_devices(backend='cpu')[0]).reshape(1,1,1), axis_names=('data', 'seq', 'model')):
         model_no_init = model_cls(model_config, _do_init=False)
     
     # Define sharding for model and optimizer

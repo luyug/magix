@@ -11,6 +11,7 @@ from jax.sharding import PartitionSpec as PS
 from jax._src import mesh as mesh_lib
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental.shard_map import shard_map
+from jax.ad_checkpoint import checkpoint_name
 
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
@@ -55,7 +56,7 @@ class FlaxMistralRotaryEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        head_dim = self.config.head_dim
         self.sincos = create_sinusoidal_positions(
             self.config.max_position_embeddings, head_dim, base=self.config.rope_theta)
 
@@ -88,13 +89,19 @@ class FlaxMistralMLP(nn.Module):
         self.up_proj = nn.Dense(inner_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init)
 
     def __call__(self, hidden_states):
-        up_proj_states = self.up_proj(hidden_states)
-        gate_states = self.act(self.gate_proj(hidden_states))
+        up_proj_states = self.up_proj(hidden_states).astype(jnp.bfloat16)
+        gate_states = self.gate_proj(hidden_states).astype(jnp.bfloat16)
         
-        up_proj_states = lax.with_sharding_constraint(up_proj_states, PS('data', None, 'model'))
-        gate_states = lax.with_sharding_constraint(gate_states, PS('data', None, 'model'))
+        up_proj_states = lax.with_sharding_constraint(up_proj_states, PS('data', 'seq', 'model'))
+        gate_states = lax.with_sharding_constraint(gate_states, PS('data', 'seq', 'model'))
+        
+        up_proj_states = checkpoint_name(up_proj_states, "up_proj")
+        gate_states = checkpoint_name(gate_states, "gate_proj")
+
+        gate_states = self.act(gate_states).astype(jnp.bfloat16)
 
         hidden_states = self.down_proj(up_proj_states * gate_states)
+        hidden_states = checkpoint_name(hidden_states, "down_proj")
         return hidden_states
 
 
@@ -141,17 +148,17 @@ class FlaxMistralAttention(nn.Module):
         config = self.config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = config.head_dim
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.attention_softmax_in_fp32 = self.dtype is not jnp.float32
         self.rope_theta = config.rope_theta
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
+        # if (self.head_dim * self.num_heads) != self.hidden_size:
+        #     raise ValueError(
+        #         f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+        #         f" and `num_heads`: {self.num_heads})."
+        #     )
         self.q_proj = nn.Dense(self.num_heads * self.head_dim, use_bias=False, dtype=self.dtype)
         self.k_proj = nn.Dense(self.num_key_value_heads * self.head_dim, use_bias=False, dtype=self.dtype)
         self.v_proj = nn.Dense(self.num_key_value_heads * self.head_dim, use_bias=False, dtype=self.dtype)
@@ -163,7 +170,7 @@ class FlaxMistralAttention(nn.Module):
         return hidden_states.reshape(hidden_states.shape[:2] + (num_heads, self.head_dim))
 
     def _merge_heads(self, hidden_states):
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
+        return hidden_states.reshape(hidden_states.shape[:2] + (-1,))
 
     @nn.compact
     def _concatenate_to_cache(self, key, value, query, attention_mask):
@@ -206,9 +213,17 @@ class FlaxMistralAttention(nn.Module):
         output_attentions: bool = False,
         init_cache: bool = False,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        query_states = self.q_proj(hidden_states).astype(jnp.bfloat16)
+        key_states = self.k_proj(hidden_states).astype(jnp.bfloat16)
+        value_states = self.v_proj(hidden_states).astype(jnp.bfloat16)
+        
+        query_states = lax.with_sharding_constraint(query_states, PS('data', 'seq', 'model'))
+        key_states = lax.with_sharding_constraint(key_states, PS('data', 'seq', 'model'))
+        value_states = lax.with_sharding_constraint(value_states, PS('data', 'seq', 'model'))
+        
+        query_states = checkpoint_name(query_states, "q")
+        key_states = checkpoint_name(key_states, "k")
+        value_states = checkpoint_name(value_states, "v")
 
         query_states = self._split_heads(query_states, self.num_heads)
         key_states = self._split_heads(key_states, self.num_key_value_heads)
@@ -266,32 +281,42 @@ class FlaxMistralAttention(nn.Module):
                 dtype=attention_dtype,
             )
             
-            query_states = lax.with_sharding_constraint(query_states, PS('data', None, 'model', None))
-            key_states = lax.with_sharding_constraint(key_states, PS('data', None, 'model', None))
-            value_states = lax.with_sharding_constraint(value_states, PS('data', None, 'model', None))
+            # query_states = lax.with_sharding_constraint(query_states, PS('data', None, 'model', None))
+            # key_states = lax.with_sharding_constraint(key_states, PS('data', None, 'model', None))
+            # value_states = lax.with_sharding_constraint(value_states, PS('data', None, 'model', None))
             if self.attention_softmax_in_fp32:
                 attn_weights = attn_weights.astype(self.dtype)
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_states)
             
         else:
-            query, key, value = map(lambda x: x.astype(jnp.bfloat16), (query_states, key_states, value_states))
+            query, key, value = map(
+                lambda x: x.astype(jnp.bfloat16),
+                (query_states, key_states, value_states),
+            )
+            seq_lens = jnp.full((query.shape[0],), query.shape[1], dtype=jnp.int32)
 
             attn_output = te_attn.fused_attn(
                 (query, key, value),
                 None,
-                ~attention_mask,
+                te_attn.SequenceDescriptor.from_seqlens(seqlens=(seq_lens, seq_lens)),
+                # te_attn.SequenceDescriptor.from_seqlens(seqlens=(input_mask[:,0,0].sum(1), input_mask[:,0,0].sum(1))),
                 None,
                 attn_bias_type=te_attn.AttnBiasType.NO_BIAS,
-                attn_mask_type=te_attn.AttnMaskType.PADDING_CAUSAL_MASK,
+                attn_mask_type=te_attn.AttnMaskType.CAUSAL_MASK,
                 qkv_layout=te_attn.QKVLayout.BSHD_BSHD_BSHD,
-                scaling_factor=1.0 / math.sqrt(query.shape[-1]),
-                dropout_probability=0,
+                scaling_factor=1.0 / math.sqrt(self.head_dim),
+                dropout_probability=0.0,
                 is_training=not deterministic,
+                context_parallel_axis='seq',
+                context_parallel_strategy = te_attn.CPStrategy.DEFAULT,
             )
-            attn_output = lax.with_sharding_constraint(attn_output, PS('data', None, 'model', None))
+            attn_weights = None
 
         attn_output = self._merge_heads(attn_output)
+        # attn_output = lax.with_sharding_constraint(attn_output, PS('data', None, 'model'))
         attn_output = self.o_proj(attn_output)
+        # attn_output = lax.with_sharding_constraint(attn_output, PS('data', None, 'model'))
+        attn_output = checkpoint_name(attn_output, "o")
 
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
         return outputs
@@ -307,6 +332,11 @@ class FlaxMistralDecoderLayer(nn.Module):
         self.post_attention_layernorm = FlaxMistralRMSNorm(self.config, dtype=self.dtype)
         self.mlp = FlaxMistralMLP(self.config, dtype=jnp.bfloat16)
 
+
+    @partial(
+        nn.remat,
+        static_argnums=(4, 5, 6),
+    )
     def __call__(
         self,
         hidden_states,
@@ -353,12 +383,12 @@ class FlaxMistralPreTrainedModel(FlaxPreTrainedModel):
     module_class: nn.Module = None
     
     partition_rules = {
-        'embed_tokens/embedding': PS('data', 'model'),
-        'lm_head': PS('data', 'model'),
-        'mlp/(gate|up)_proj': PS('data', 'model'),
-        'mlp/down_proj': PS('model', 'data'),
-        'self_attn/(k|q|v)_proj': PS('data', 'model'),
-        'self_attn/o_proj': PS('model', 'data'),
+        'embed_tokens/embedding': PS(('data','seq'), 'model'),
+        'lm_head': PS(('data','seq'), 'model'),
+        'mlp/(gate|up)_proj': PS(('data','seq'), 'model'),
+        'mlp/down_proj': PS('model', ('data','seq')),
+        'self_attn/(k|q|v)_proj': PS(('data','seq'), 'model'),
+        'self_attn/o_proj': PS('model', ('data','seq')),
         # 'norm/weight': PS('model'),
     }
     
@@ -509,7 +539,7 @@ class FlaxMistralLayerCollection(nn.Module):
         all_hidden_states = () if output_hidden_states else None
 
         for block in self.blocks:
-            hidden_states = lax.with_sharding_constraint(hidden_states, PS('data', None, 'model'))
+            hidden_states = lax.with_sharding_constraint(hidden_states, PS('data', 'seq', 'model'))
             
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -560,7 +590,7 @@ class FlaxMistralModule(nn.Module):
         return_dict: bool = True,
     ):
         input_embeds = self.embed_tokens(input_ids.astype("i4"))
-        input_embeds = lax.with_sharding_constraint(input_embeds, PS('data', None, 'model'))
+        # input_embeds = lax.with_sharding_constraint(input_embeds, PS('data', 'seq'))
 
         outputs = self.layers(
             input_embeds,
@@ -631,9 +661,9 @@ class FlaxMistralForCausalLMModule(nn.Module):
         )
 
         hidden_states = outputs[0]
-        hidden_states = lax.with_sharding_constraint(hidden_states, PS('data', None, 'model'))
+        # hidden_states = lax.with_sharding_constraint(hidden_states, PS('data', 'seq', 'model'))
         lm_logits = self.lm_head(hidden_states)
-        hidden_states = lax.with_sharding_constraint(hidden_states, PS('data', None, 'model'))
+        # hidden_states = lax.with_sharding_constraint(hidden_states, PS('data', 'seq', 'model'))
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]

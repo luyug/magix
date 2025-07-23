@@ -110,11 +110,16 @@ def make_scan_params(params):
 
 
 if __name__ == "__main__":
+    """
+    usage: python convert_hf_to_jax.py --model_name meta-llama/Meta-Llama-3-70B-Instruct --model_type llama --save_path ./converted_model --make_scan_param
+    """
+    
     parser = ArgumentParser()
     parser.add_argument("--model_name", type=str, default='meta-llama/Meta-Llama-3-70B-Instruct')
     parser.add_argument("--model_type", type=str, default='llama')
     parser.add_argument("--save_path", type=str, required=True)
     parser.add_argument("--make_scan_param", action='store_true')
+    parser.add_argument("--bf16", action='store_true')
     args = parser.parse_args()
     
     
@@ -128,7 +133,7 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, config=config)
     print("Model loaded", flush=True)
 
-    mesh = magix.create_device_mesh((1, 1), ('data', 'model'))
+    mesh = magix.create_device_mesh((1, 1, 1), ('data', 'seq', 'model'))
 
     _model_cls = models.CAUSAL_LM_MODEL_MAPPING.get(MODEL_TYPE, None)
     if _model_cls is None:
@@ -147,14 +152,20 @@ if __name__ == "__main__":
     for k in tqdm(old_keys, desc="Converting PyTorch weights to Flax weights"):
         pt_tuple_key = tuple(k.split("."))
         name, tensor = rename_key_and_reshape_tensor(pt_tuple_key, sdict[k], abs_weight_dict, flax_model.base_model_prefix)
-        new_sdict[name] = tensor.numpy()
+        if not args.bf16:
+            new_sdict[name] = tensor.numpy()
+        else:
+            new_sdict[name] = jnp.array(tensor.numpy(), dtype=jnp.bfloat16)
         del sdict[k]
 
     del sdict
     params = flax.traverse_util.unflatten_dict(new_sdict)
 
+    params = jax.tree.map(jnp.array, params)
 
     if MAKE_SCAN_PARAM:
         params = make_scan_params(params)
+        
+    params = jax.tree.map(jnp.array, params)
 
     save_model_local(params, SAVE_PATH)

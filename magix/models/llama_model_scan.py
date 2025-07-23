@@ -88,7 +88,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
             dtype=jnp.bfloat16,
         )
         self.layers = FlaxLlamaLayerCollection(self.config, dtype=self.dtype)
-        self.lm_head_with_norm = LlamaLMHeadWithNorm(self.config, dtype=self.dtype)
+        self.lm_head_with_norm = LlamaLMHeadWithNorm(self.config, dtype=jnp.bfloat16)
 
     def __call__(
         self,

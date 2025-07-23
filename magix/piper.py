@@ -185,6 +185,7 @@ def pipe_step(
             a_buffer,
             pre_fn_out
         )
+        # a_buffer = lax.optimization_barrier(a_buffer)
 
     ## gather input from t_buffer ##########
     # l_buffer: Tuple[Array[max_delay, stage, batch, layer_per_stage, ..., feature]]
@@ -208,6 +209,8 @@ def pipe_step(
         )
         g = lax.with_sharding_constraint(g, PS('data', None, 'model'))
         g_buffer = g_buffer.at[-1].set(g)
+        # g_buffer = lax.optimization_barrier(g_buffer)
+        # post_params_grads = lax.optimization_barrier(post_params_grads)
 
 
     ## pipe_forward ##########
@@ -219,10 +222,13 @@ def pipe_step(
         pipe_fwd,
         lambda: (a_buffer, jax.tree_map(lambda x: jnp.zeros_like(x[0]), l_buffer)),
     )
+    # stage_out = lax.optimization_barrier(stage_out)
+    # layer_ins = lax.optimization_barrier(layer_ins)
 
     # y output
     new_y = stage_out[0]  # get rid of shared input
     new_y = new_y[-1] # last stage output
+    new_y = lax.with_sharding_constraint(new_y, PS('data', 'pipe', 'model'))
     
     # saved layer inputs for backward
     @partial(jax.vmap, in_axes=(1, 0, 0), out_axes=1)
@@ -235,6 +241,7 @@ def pipe_step(
     )
     
     # permute buffer in the fwd pipe
+    # stage_out = lax.optimization_barrier(stage_out)
     a_buffer = jax.tree_map(
         lambda x: jnp.roll(x, 1, axis=0),
         stage_out
@@ -264,6 +271,10 @@ def pipe_step(
             g_buffer
         ),
     )
+    # g_pipe_out = lax.optimization_barrier(g_pipe_out)
+    # pipe_param_grads = lax.optimization_barrier(pipe_param_grads)
+    # g_buffer = lax.optimization_barrier(g_buffer)
+    # g_buffer = jnp.roll(g_buffer, -1, axis=0)
 
     ## pre_fn backward ##########
     with jax.named_scope('Pre-Pipe Function Bwd'):
@@ -276,5 +287,6 @@ def pipe_step(
             pre_fn_bwd,
             lambda: jax.tree_map(lambda x: jnp.zeros_like(x), param_pre),
         )
+        # pre_param_grads = lax.optimization_barrier(pre_param_grads)
 
     return loss, (a_buffer, l_buffer, g_buffer, new_y, step_idx + 1, total_example_steps), (pre_param_grads, pipe_param_grads, post_params_grads)

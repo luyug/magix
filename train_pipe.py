@@ -1,10 +1,10 @@
 import os
 
-os.environ.update({
-  "NCCL_LL128_BUFFSIZE": "-2",
-  "NCCL_LL_BUFFSIZE": "-2",
-   "NCCL_PROTO": "SIMPLE,LL,LL128",
- })
+# os.environ.update({
+#   "NCCL_LL128_BUFFSIZE": "-2",
+#   "NCCL_LL_BUFFSIZE": "-2",
+#    "NCCL_PROTO": "SIMPLE,LL,LL128",
+#  })
 
 os.environ["XLA_FLAGS"] = (
     "--xla_gpu_cuda_data_dir=/sw/user/cudatoolkits/installs/cuda-12.2.0 "
@@ -17,17 +17,17 @@ os.environ["XLA_FLAGS"] = (
     # "--xla_gpu_enable_triton_gemm=false "
     # "--xla_gpu_triton_gemm_any=false "
     # "--xla_gpu_enable_triton_hopper=false "
-    # "--xla_gpu_all_reduce_combine_threshold_bytes=536870912 "
-    # "--xla_gpu_all_gather_combine_threshold_bytes=536870912 "
-    # "--xla_gpu_reduce_scatter_combine_threshold_bytes=16777216 "
+    # "--xla_gpu_all_reduce_combine_threshold_bytes=1073741824 "
+    # "--xla_gpu_all_gather_combine_threshold_bytes=1073741824 "
+    # "--xla_gpu_reduce_scatter_combine_threshold_bytes=134217728 "
     # "--xla_gpu_enable_pipelined_all_gather=true "
     # "--xla_gpu_enable_pipelined_reduce_scatter=true "
     # "--xla_gpu_enable_pipelined_all_reduce=true "
     # "--xla_gpu_enable_while_loop_double_buffering=true "
-    # "--xla_gpu_multi_streamed_windowed_einsum=true "
-    # "--xla_gpu_threshold_for_windowed_einsum_mib=4096 "
-    # "--xla_gpu_enable_all_gather_combine_by_dim=false "
-    # "--xla_gpu_enable_reduce_scatter_combine_by_dim=false "
+    "--xla_gpu_multi_streamed_windowed_einsum=true "
+    "--xla_gpu_threshold_for_windowed_einsum_mib=4096 "
+    "--xla_gpu_enable_all_gather_combine_by_dim=false "
+    "--xla_gpu_enable_reduce_scatter_combine_by_dim=false "
     # "--xla_gpu_enable_custom_fusions=true "
     # "--xla_allow_excess_precision=true "
     # "--xla_gpu_enable_pipelined_p2p=true "  # <---- compile error
@@ -42,7 +42,7 @@ os.environ["XLA_FLAGS"] = (
 
 os.environ["NCCL_P2P_LEVEL"] = "NVL"
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-os.environ["NCCL_NVLS_ENABLE"] = "1"
+os.environ["NCCL_NVLS_ENABLE"] = "0"
 os.environ["NCCL_IB_SL"] = "1"
 os.environ["NCCL_NCHANNELS_PER_NET_PEER"] = "4"
 
@@ -64,6 +64,7 @@ jax.distributed.initialize(
     local_device_ids=[0, 1, 2, 3],
 )
 if jax.process_index() == 0:
+    print('Jax version:', jax.__version__, flush=True)
     print('Discovered devices:', jax.devices(), flush=True)
 
 
@@ -230,12 +231,12 @@ OPT_SHARDING_RULE = {
     'mlp/down_proj': PS('pipe', 'model', 'data'),
     'self_attn/(k|q|v)_proj': PS('pipe', 'data', 'model'),
     'self_attn/o_proj': PS('pipe', 'model', 'data'),
-    'layernorm/weight': PS('pipe'),
+    'layernorm/weight': PS('pipe', ('data', 'model')),
 }
 
 COMPUTE_SHARDING_RULE = {
     'embed_tokens/embedding': PS('pipe', 'model'),
-    'lm_head/kernel': PS('pipe', 'model'),
+    'lm_head/kernel': PS(None, 'model'),
     'mlp/(gate|up)_proj': PS('pipe', None, 'model'),
     'mlp/down_proj': PS('pipe', 'model', None),
     'self_attn/(k|q|v)_proj': PS('pipe', None, 'model'),
@@ -256,7 +257,7 @@ PIPE_ACCUM_SHARDING_RULE = {
     'mlp/down_proj': PS('pipe', None, 'model', 'data'),
     'self_attn/(k|q|v)_proj': PS('pipe', None, 'data', 'model'),
     'self_attn/o_proj': PS('pipe', None, 'model', 'data'),
-    'layernorm/weight': PS('pipe'),
+    'layernorm/weight': PS('pipe', None, ('data', 'model')),
 }
 
 
@@ -486,14 +487,14 @@ def main():
                     all_params
                 )
                 loss_acc += loss
-                grads = jax.tree.map(lambda x: x.astype(jnp.float32), grads)
+                grads = jax.tree.map(lambda x: x.astype(jnp.bfloat16), grads)
                 grads_acc = jax.tree.map(lambda acc, g: acc + g, grads_acc, grads)
                 
                 new_carry = (loss_acc, grads_acc, new_pipe_state)
                 return (i+1, new_carry)
 
             # run the pipeline
-            accum = jax.tree.map(lambda x: jnp.zeros(x.shape, jnp.float32), all_params)
+            accum = jax.tree.map(lambda x: jnp.zeros(x.shape, jnp.bfloat16), all_params)
             accum = (
                 accum[0],
                 lax.with_sharding_constraint(accum[1], magix.spmd_utils.get_sharding_tree(accum[1], PIPE_ACCUM_SHARDING_RULE)),
@@ -521,7 +522,8 @@ def main():
             compute_params = model.to_bf16(params)
             compute_params = lax.with_sharding_constraint(compute_params, magix.spmd_utils.get_sharding_tree(params, COMPUTE_SHARDING_RULE))
             loss, grads = compute_grad(compute_params, input_ids, attention_mask)
-            grads = jax._src.ad_checkpoint._optimization_barrier(grads)
+            # grads = lax.optimization_barrier(grads)
+            # grads = jax._src.ad_checkpoint._optimization_barrier(grads)
             
         metrics = {"loss": loss}
         with jax.named_scope('OptimizerStep'):
@@ -570,6 +572,7 @@ def main():
                 input_rng, train_dataset, train_args.batch_size, shuffle=True)
             steps_per_epoch = len(train_dataset) // train_args.batch_size
             # train
+            _batch = batch_loader(0)
             for step in trange(steps_per_epoch, disable=jax.process_index() != 0):
                 cur_step = epoch * (len(train_dataset) // train_args.batch_size) + step
                 if lastest_step >= cur_step:
@@ -577,18 +580,18 @@ def main():
                 elif lastest_step == cur_step:
                     logger.info('Resuming training from step %d', cur_step)
                 
-                batch = batch_loader(step)
+                # batch = batch_loader(step)
                 dropout_rngs = jax.random.fold_in(dropout_rng, cur_step)
                 if step in train_args.profiling_steps:
                     from ctypes import cdll
                     libcudart = cdll.LoadLibrary('libcudart.so')
                     libcudart.cudaProfilerStart()
-                    params, opt_state, metrics = p_train_step(params, opt_state, batch)
+                    params, opt_state, metrics = p_train_step(params, opt_state, _batch)
                     jax.tree.map(lambda x: x.block_until_ready(), (params, opt_state))
                     libcudart.cudaProfilerStop()
 
                 else:
-                    params, opt_state, metrics = p_train_step(params, opt_state, batch)
+                    params, opt_state, metrics = p_train_step(params, opt_state, _batch)
                 
                 is_last_step = (cur_step + 1) == total_train_steps
                 # if cur_step > 0:

@@ -41,11 +41,11 @@ def llama3_rope_scaline_freq(inv_freq, rope_scaling_config):
     
 
     wavelen = 2 * math.pi / inv_freq
-    inv_freq_llama = np.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+    inv_freq_llama = jnp.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
     smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
     smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
     is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
-    inv_freq_llama = np.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
+    inv_freq_llama = jnp.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
     
     return inv_freq_llama
     
@@ -56,12 +56,11 @@ def create_sinusoidal_positions(num_pos, dim, base=10000, scaling_config=None):
     if scaling_config is not None:
         inv_freq = llama3_rope_scaline_freq(inv_freq, scaling_config)
     
-    freqs = np.einsum("i , j -> i j", np.arange(num_pos), inv_freq).astype("float32")
+    freqs = jnp.einsum("i , j -> i j", jnp.arange(num_pos), inv_freq).astype("float32")
 
-    emb = np.concatenate((freqs, freqs), axis=-1)
-    out = np.concatenate((np.sin(emb)[:, None, :], np.cos(emb)[:, None, :]), axis=-1)
-    return jnp.array(out[:, :, :num_pos])
-
+    emb = jnp.concatenate((freqs, freqs), axis=-1)
+    out = jnp.concatenate((jnp.sin(emb)[:, None, :], jnp.cos(emb)[:, None, :]), axis=-1)
+    return out
 
 def rotate_half(tensor):
     """Rotates half the hidden dims of the input."""
@@ -97,15 +96,22 @@ class FlaxLlamaRotaryEmbedding(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
 
-    def setup(self):
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
-        self.sincos = create_sinusoidal_positions(
-            self.config.max_position_embeddings, head_dim, base=self.config.rope_theta,
-            scaling_config=getattr(self.config, "rope_scaling", None),
-        )
+    # def setup(self):
+        # head_dim = self.config.hidden_size // self.config.num_attention_heads
+        # self.sincos = create_sinusoidal_positions(
+        #     self.config.max_position_embeddings, head_dim, base=self.config.rope_theta,
+        #     scaling_config=getattr(self.config, "rope_scaling", None),
+        # )
 
     def __call__(self, key, query, position_ids):
-        sincos = self.sincos[position_ids]
+        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        sincos = create_sinusoidal_positions(
+            position_ids.shape[1], 
+            dim=head_dim,
+            base=self.config.rope_theta,
+            scaling_config=getattr(self.config, "rope_scaling", None),
+        )
+        sincos = sincos[position_ids]
         sin_pos, cos_pos = jnp.split(sincos, 2, axis=-1)
 
         key = apply_rotary_pos_emb(key, sin_pos, cos_pos)
@@ -197,9 +203,9 @@ class FlaxLlamaAttention(nn.Module):
         init_cache: bool = False,
         output_attentions: bool = False,
     ):
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
+        query = self.q_proj(hidden_states).astype(jnp.bfloat16)
+        key = self.k_proj(hidden_states).astype(jnp.bfloat16)
+        value = self.v_proj(hidden_states).astype(jnp.bfloat16)
         
         query = lax.with_sharding_constraint(query, PS('data', None, 'model'))
         key = lax.with_sharding_constraint(key, PS('data', None, 'model'))
@@ -322,13 +328,13 @@ class FlaxLlamaMLP(nn.Module):
         up_proj_states = self.up_proj(hidden_states)
         gate_states = self.act(self.gate_proj(hidden_states))
         
-        up_proj_states = lax.with_sharding_constraint(up_proj_states, PS('data', None, 'model'))
-        gate_states = lax.with_sharding_constraint(gate_states, PS('data', None, 'model'))
+        up_proj_states = lax.with_sharding_constraint(up_proj_states, PS('data', None, 'model')).astype(jnp.bfloat16)
+        gate_states = lax.with_sharding_constraint(gate_states, PS('data', None, 'model')).astype(jnp.bfloat16)
         up_proj_states = checkpoint_name(up_proj_states, "up_proj")
         gate_states = checkpoint_name(gate_states, "gate_proj")
         
         hidden_states = up_proj_states * gate_states
-        hidden_states = self.down_proj(hidden_states)
+        hidden_states = self.down_proj(hidden_states).astype(jnp.bfloat16)
         hidden_states = checkpoint_name(hidden_states, "down_proj")
         return hidden_states
 
